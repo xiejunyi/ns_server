@@ -35,7 +35,7 @@
 -behaviour(gen_server).
 
 %% public functions
--export([start_link/6]).
+-export([start_link/1]).
 
 %% gen_server callbacks
 -export([init/1, terminate/2, code_change/3]).
@@ -50,13 +50,19 @@
           rep,
           vb,
           mode,
+          upr_server,
           init_throttle,
           work_throttle,
           parent}).
 
-start_link(Rep, Vb, InitThrottle, WorkThrottle, Parent, RepMode) ->
+
+start_link(#xdc_vb_rep_start_option{
+              rep = Rep, vb = Vb, init_throttle = InitThrottle,
+              work_throttle = WorkThrottle, parent = Parent,
+              mode = RepMode, upr_server = UPRServ}) ->
     InitState = #init_state{rep = Rep,
                             vb = Vb,
+                            upr_server = UPRServ,
                             mode = RepMode,
                             init_throttle = InitThrottle,
                             work_throttle = WorkThrottle,
@@ -246,7 +252,8 @@ handle_call({report_seq_done,
     {noreply, update_status_to_parent(NewState)};
 
 handle_call({worker_done, Pid}, _From,
-            #rep_state{rep_details = Rep, workers = Workers, status = VbStatus, xmem_srv = XMemSrv, parent = Parent} = State) ->
+            #rep_state{rep_details = Rep, workers = Workers, status = VbStatus, xmem_srv = XMemSrv,
+                       upr_server = _UPRSrv, parent = Parent} = State) ->
     case Workers -- [Pid] of
         Workers ->
             {stop, {unknown_worker_done, Pid}, ok, State};
@@ -302,16 +309,17 @@ handle_call({worker_done, Pid}, _From,
 
             %% finally report stats to bucket replicator and tell it that I am idle
             NewState = update_status_to_parent(State2#rep_state{
-                                                  workers = [],
-                                                  status = VbStatus3,
-                                                  source = undefined,
-                                                  src_master_db = undefined,
-                                                  target = undefined,
-                                                  tgt_master_db = undefined}),
+                                                 workers = [],
+                                                 status = VbStatus3,
+                                                 source = undefined,
+                                                 src_master_db = undefined,
+                                                 target = undefined,
+                                                 tgt_master_db = undefined}),
+
 
             %% cancel the timer since we will start it next time the vb rep waken up
             NewState2 = xdc_vbucket_rep_ckpt:cancel_timer(NewState),
-            % hibernate to reduce memory footprint while idle
+            %% hibernate to reduce memory footprint while idle
             {reply, ok, NewState2, hibernate};
         Workers2 ->
             {reply, ok, State#rep_state{workers = Workers2}}
@@ -500,6 +508,7 @@ update_status_to_parent(#rep_state{parent = Parent,
 
 init_replication_state(#init_state{rep = Rep,
                                    vb = Vb,
+                                   upr_server = UPRServ,
                                    mode = RepMode,
                                    work_throttle = Throttle,
                                    parent = Parent}) ->
@@ -644,6 +653,7 @@ init_replication_state(#init_state{rep = Rep,
       %% XMem not started
       xmem_srv = nil,
       xmem_remote = XMemRemote,
+      upr_server = UPRServ,
       status = #rep_vb_status{vb = Vb,
                               pid = self(),
                               %% init per vb replication stats from checkpoint doc
@@ -673,8 +683,9 @@ init_replication_state(#init_state{rep = Rep,
                                          XMemRemote#xdc_rep_xmem_remote.port,
                                          XMemRemote#xdc_rep_xmem_remote.bucket])
                     end,
-    ?xdcr_debug("vb ~p replication state initialized: (local db: ~p, remote db: ~p, mode: ~p, xmem remote: ~s)",
-                [Vb, RepState#rep_state.source_name,
+    ?xdcr_debug("vb ~p replication state initialized: (local db: ~p, upr_server: ~p (if nil xdcrfrom disk), "
+                "remote db: ~p, mode: ~p, xmem remote: ~s)",
+                [Vb, RepState#rep_state.source_name, UPRServ,
                  misc:sanitize_url(RepState#rep_state.target_name), RepMode, XMemRemoteStr]),
     RepState.
 
@@ -698,11 +709,13 @@ start_replication(#rep_state{
                      last_checkpoint_time = LastCkptTime,
                      status = #rep_vb_status{vb = Vb},
                      rep_details = #rep{id = Id, options = Options, target = TargetRef},
+                     upr_server = UPRServ,
                      xmem_remote = Remote
                     } = State) ->
 
     WorkStart = now(),
 
+    Vb = (State#rep_state.status)#rep_vb_status.vb,
     NumWorkers = get_value(worker_processes, Options),
     BatchSizeItems = get_value(worker_batch_size, Options),
     {ok, Source} = couch_api_wrap:db_open(SourceName, []),
@@ -741,9 +754,15 @@ start_replication(#rep_state{
                                                {max_items, BatchSizeItems * NumWorkers * 2},
                                                {max_size, 100 * 1024 * NumWorkers}
                                               ]),
-    %% This starts the _changes reader process. It adds the changes from
-    %% the source db to the ChangesQueue.
-    ChangesReader = spawn_changes_reader(StartSeq, Source, ChangesQueue),
+
+    ChangesReader =
+        case UPRServ of
+            nil ->
+                spawn_changes_reader_from_couchdb(StartSeq, Source, ChangesQueue);
+            P ->
+                spawn_changes_reader_from_upr(P, Vb, StartSeq, ChangesQueue)
+        end,
+
     %% Changes manager - responsible for dequeing batches from the changes queue
     %% and deliver them to the worker processes.
     ChangesManager = spawn_changes_manager(self(), ChangesQueue, BatchSizeItems),
@@ -753,14 +772,19 @@ start_replication(#rep_state{
     MaxConns = get_value(http_connections, Options),
     OptRepThreshold = get_value(optimistic_replication_threshold, Options),
 
-    ?xdcr_trace("changes reader process (PID: ~p) and manager process (PID: ~p) "
+    ReadDataFrom = case UPRServ of
+                       nil ->
+                           "database files on disk via couchdb";
+                       _ ->
+                           "memcached-upr via UPR connection"
+                   end,
+    ?xdcr_debug("changes reader process (PID: ~p read data from ~s) and manager process (PID: ~p) "
                 "created, now starting worker processes...",
-                [ChangesReader, ChangesManager]),
+                [ChangesReader, ReadDataFrom, ChangesManager]),
     Changes = couch_db:count_changes_since(Source, StartSeq),
 
 
     %% start xmem server if it has not started
-    Vb = (State#rep_state.status)#rep_vb_status.vb,
     XPid = case Remote of
                nil ->
                    nil;
@@ -837,6 +861,7 @@ start_replication(#rep_state{
     %% check if we need do checkpointing, replicator will crash if checkpoint failure
     State1 = State#rep_state{
                xmem_srv = XPid,
+               upr_server = UPRServ,
                source = Source,
                target = Target,
                src_master_db = SrcMasterDb,
@@ -920,20 +945,6 @@ update_number_of_changes(#rep_state{source_name = Src,
     end.
 
 
-spawn_changes_reader(StartSeq, Db, ChangesQueue) ->
-    spawn_link(fun() ->
-                       read_changes(StartSeq, Db, ChangesQueue)
-               end).
-
-read_changes(StartSeq, Db, ChangesQueue) ->
-    couch_db:changes_since(Db, StartSeq,
-                           fun(#doc_info{local_seq = Seq} = DocInfo, ok) ->
-                                   ok = couch_work_queue:queue(ChangesQueue, DocInfo),
-                                   put(last_seq, Seq),
-                                   {ok, ok}
-                           end, [], ok),
-    couch_work_queue:close(ChangesQueue).
-
 spawn_changes_manager(Parent, ChangesQueue, BatchSize) ->
     spawn_link(fun() ->
                        changes_manager_loop_open(Parent, ChangesQueue, BatchSize)
@@ -946,7 +957,8 @@ changes_manager_loop_open(Parent, ChangesQueue, BatchSize) ->
                 closed ->
                     ok; % now done!
                 {ok, Changes, _Size} ->
-                    #doc_info{local_seq = Seq} = lists:last(Changes),
+                    XDCDoc = lists:last(Changes),
+                    Seq = (XDCDoc#xdc_doc.docinfo)#doc_info.local_seq,
                     ReportSeq = Seq,
                     ok = gen_server:cast(Parent, {report_seq, ReportSeq}),
                     From ! {changes, self(), Changes, ReportSeq},
@@ -1074,3 +1086,50 @@ get_changes_queue_stats(#rep_state{changes_queue = ChangesQueue} = _State) ->
 
     {ChangesQueueSize, ChangesQueueDocs}.
 
+spawn_changes_reader_from_couchdb(StartSeq, Db, ChangesQueue) ->
+    spawn_link(fun() ->
+                       read_changes_from_couchdb(StartSeq, Db, ChangesQueue)
+               end).
+read_changes_from_couchdb(StartSeq, Db, ChangesQueue) ->
+    couch_db:changes_since(Db, StartSeq,
+                           fun(#doc_info{} = DocInfo, ok) ->
+                                   XDCDoc = #xdc_doc{docinfo = DocInfo},
+                                   ok = couch_work_queue:queue(ChangesQueue, XDCDoc),
+                                   put(last_seq, DocInfo#doc_info.local_seq),
+                                   {ok, ok}
+                           end, [], ok),
+    couch_work_queue:close(ChangesQueue).
+
+
+spawn_changes_reader_from_upr(UPRSrv, Vb, StartSeq, ChangesQueue) ->
+    spawn_link(fun() ->
+                       read_changes_from_upr(UPRSrv, Vb, StartSeq, ChangesQueue)
+               end).
+
+read_changes_from_upr(UPRSrv, Vb, StartSeq, ChangesQueue) ->
+    RequestOption = #xdc_upr_stream_request_option{
+      vb = Vb,
+      start_seq = StartSeq,
+      cbk_func = fun({Seq, #doc{id = Key} = Doc, _Vb}, _Acc) ->
+                         XDCDoc = xdc_rep_utils:buildXDCDocFromMutation(Doc, Seq),
+                         ok = couch_work_queue:queue(ChangesQueue, XDCDoc),
+                         ?xdcr_debug("XDCR-UPR: for vb: ~p queue a doc (key: ~p) into changes queue, last seq: ~p",
+                                     [Vb, Key, Seq]),
+                         put(last_seq, Seq),
+                         Seq
+                 end},
+    ?xdcr_debug("XDCR-UPR: begin streaming docs from UPR, StartSeq: ~p", [StartSeq]),
+    case xdc_upr_server:stream_mutations(UPRSrv, RequestOption) of
+        {ok, 0, StartSeq} ->
+            ?xdcr_debug("XDCR-UPR: nothing to stream for vb: ~p, done", [Vb]),
+            ok;
+        {ok, MutCount, LastSeq} ->
+            ?xdcr_debug("XDCR-UPR: stream ~p mutations from UPR, last seq: ~p", [MutCount, LastSeq]),
+            ok;
+        {rollback, RollbackSeq} ->
+            read_changes_from_upr(UPRSrv, Vb, RollbackSeq, ChangesQueue);
+        {error, closed} ->
+            ?xdcr_debug("XDCR-UPR: connection closed, quit"),
+            ok
+    end,
+    couch_work_queue:close(ChangesQueue).

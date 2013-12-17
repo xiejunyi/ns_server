@@ -25,6 +25,7 @@
 -export([get_master_db/1, get_checkpoint_log_id/2]).
 -export([get_trace_dump_invprob/0]).
 -export([sanitize_status/3, get_rep_info/1]).
+-export([buildXDCDocFromMutation/2]).
 
 -include("xdc_replicator.hrl").
 
@@ -230,3 +231,20 @@ sanitize_status(_Opt, _PDict, State) ->
 get_rep_info(#rep{source = Src, target = Tgt, replication_mode = Mode}) ->
     ?format_msg("from ~p to ~p in mode: ~p", [Src, Tgt, Mode]).
 
+buildXDCDocFromMutation(#doc{} = Doc, Seq) ->
+    #doc{id = Key,
+         rev = {RevSeq, <<CAS:64, Exp:32, Flag:32>>},
+         body = Value,
+         deleted = Deletion} = Doc,
+
+    DocInfo = #doc_info{
+                 id = Key,
+                 deleted = Deletion,
+                 local_seq = Seq,
+                 rev = {RevSeq, <<CAS:64, Exp:32, Flag:32>>},
+                 size = byte_size(Value)
+                },
+
+    XDCDoc = #xdc_doc{docinfo = DocInfo, body = Value, meta = []},
+    ?xdcr_debug("xdcr-junyi: build xdcodc for key: ~p", [Key]),
+    XDCDoc.

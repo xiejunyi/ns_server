@@ -12,7 +12,7 @@
 
 -module(xdc_vbucket_rep_sup).
 -behaviour(supervisor2).
--export([start_link/1, shutdown/1, start_vbucket_rep/7, stop_vbucket_rep/2]).
+-export([start_link/1, shutdown/1, start_vbucket_rep/1, stop_vbucket_rep/2]).
 -export([vbucket_reps/1]).
 
 -export([init/1]).
@@ -24,7 +24,10 @@ start_link(Specs) ->
     ?xdcr_debug("xdc vbucket replicator supervisor started: ~p", [Sup]),
     {ok, Sup}.
 
-start_vbucket_rep(Sup, Rep, Vb, InitThrottle, WorkThrottle, Parent, RepMode) ->
+start_vbucket_rep(#xdc_vb_rep_start_option{
+                     sup = Sup, rep = Rep, vb = Vb,
+                     parent = Parent, mode = RepMode} = VbRepStartOption) ->
+
     #rep{options = Options} = Rep,
     RestartWaitTime = proplists:get_value(failure_restart_interval, Options),
     ?xdcr_debug("start xdc vbucket replicator (vb: ~p, restart wait time: ~p, "
@@ -32,7 +35,7 @@ start_vbucket_rep(Sup, Rep, Vb, InitThrottle, WorkThrottle, Parent, RepMode) ->
                 [Vb, RestartWaitTime, Parent, RepMode]),
 
     Spec = {Vb,
-            {xdc_vbucket_rep, start_link, [Rep, Vb, InitThrottle, WorkThrottle, Parent, RepMode]},
+            {xdc_vbucket_rep, start_link, [VbRepStartOption]},
             {permanent, RestartWaitTime},
             100,
             worker,

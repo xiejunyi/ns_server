@@ -35,7 +35,7 @@ start_link(#rep_worker_option{cp = Cp, source = Source, target = Target,
                      end),
 
 
-    ?xdcr_trace("create queue_fetch_loop process (worker_id: ~p, pid: ~p) within replicator (pid: ~p) "
+    ?xdcr_debug("create queue_fetch_loop process (worker_id: ~p, pid: ~p) within replicator (pid: ~p) "
                 "Source: ~p, Target: ~p, ChangesManager: ~p, latency optimized: ~p",
                 [WorkerID, Pid, Cp, Source#db.name, misc:sanitize_url(Target#httpdb.url), ChangesManager, OptRepThreshold]),
 
@@ -52,6 +52,11 @@ queue_fetch_loop(WorkerID, Source, Target, Cp, ChangesManager,
         {'DOWN', _, _, _, _} ->
             ok = gen_server:call(Cp, {worker_done, self()}, infinity);
         {changes, ChangesManager, Changes, ReportSeq} ->
+
+
+ ?xdcr_debug("XDCR-UPR: received ~p mutations from UPR changes manager ~p",
+             [ChangesManager, length(Changes)]),
+
             %% get docinfo of missing ids
             {MissingDocInfoList, MetaLatency, NumDocsOptRepd} =
                 find_missing(Changes, Target, OptRepThreshold, nil),
@@ -163,7 +168,7 @@ local_process_batch([DocInfo | Rest], Cp, #db{} = Source,
 
 
 %% fetch doc using doc info
-fetch_doc(Source, #doc_info{body_ptr = _BodyPtr} = DocInfo, DocHandler, Acc) ->
+fetch_doc(Source, #xdc_doc{docinfo = DocInfo} = _XDCDoc, DocHandler, Acc) ->
     couch_api_wrap:open_doc(Source, DocInfo, [deleted], DocHandler, Acc).
 
 local_doc_handler({ok, Doc}, {Target, DocsList, Cp}) ->
@@ -218,8 +223,12 @@ find_missing(DocInfos, Target, OptRepThreshold, XMemSrv) ->
     %% smaller than or equal to threshold.
     {BigDocIdRevs, SmallDocIdRevs, DelCount, BigDocCount,
      SmallDocCount, AllRevsCount} = lists:foldr(
-                                      fun(#doc_info{id = Id, rev = Rev, deleted = Deleted, size = DocSize},
+                                      fun(#xdc_doc{docinfo = DocInfo},
                                           {BigIdRevAcc, SmallIdRevAcc, DelAcc, BigAcc, SmallAcc, CountAcc}) ->
+
+                                              #doc_info{id = Id, rev = Rev, deleted = Deleted,
+                                                        size = DocSize} = DocInfo,
+
                                               %% deleted doc is always treated as small doc, regardless of doc size
                                               {BigIdRevAcc1, SmallIdRevAcc1, DelAcc1, BigAcc1, SmallAcc1} =
                                                   case Deleted of
@@ -253,7 +262,8 @@ find_missing(DocInfos, Target, OptRepThreshold, XMemSrv) ->
 
     %% build list of docinfo for all missing keys
     MissingDocInfoList = lists:filter(
-                           fun(#doc_info{id = Id, rev = _Rev} = _DocInfo) ->
+                           fun(#xdc_doc{docinfo = DocInfo} = _XDCDoc) ->
+                                   #doc_info{id = Id} = DocInfo,
                                    case lists:keyfind(Id, 1, Missing) of
                                        %% not a missing key
                                        false ->

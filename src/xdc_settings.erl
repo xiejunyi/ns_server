@@ -67,7 +67,7 @@ get_all_settings_snapshot_by_doc_id(DocId) when is_binary(DocId) ->
     get_all_settings_snapshot(Props).
 
 settings_specs() ->
-    [{max_concurrent_reps,              per_replication, {int, 2, 256},              32},
+    [{max_concurrent_reps,              per_replication, {int, 1, 256},              1},
      {checkpoint_interval,              per_replication, {int, 60, 14400},           1800},
      {doc_batch_size_kb,                per_replication, {int, 10, 10000},           2048},
      {failure_restart_interval,         per_replication, {int, 1, 300},              30},
@@ -79,6 +79,7 @@ settings_specs() ->
      {optimistic_replication_threshold, per_replication, {int, 0, 20 * 1024 * 1024}, 256},
      {xmem_worker,                      per_replication, {int, 1, 32},               1},
      {enable_pipeline_ops,              per_replication, bool,                       true},
+     {stream_from_upr,                  per_replication, bool,                       true},
      {local_conflict_resolution,        per_replication, bool,                       false},
      {socket_options,                   per_replication, term,                       [{keepalive, true}, {nodelay, false}]},
      {supervisor_max_r,                 per_replication, {int, 1, 1000},             25},

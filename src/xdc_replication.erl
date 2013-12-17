@@ -62,6 +62,14 @@ init([#rep{source = SrcBucketBinary, replication_mode = RepMode, options = Optio
     ns_pubsub:subscribe_link(ns_config_events, NsConfigEventsHandler, []),
     ?xdcr_debug("ns config event handler subscribed", []),
 
+
+    StreamFrom = case proplists:get_value(stream_from_upr, Options) of
+                     true ->
+                         ?XDCR_FROM_UPR;
+                     _ ->
+                         ?XDCR_FROM_COUCHDB
+                 end,
+
     MaxConcurrentReps = proplists:get_value(max_concurrent_reps, Options),
     SrcSize = size(SrcBucketBinary),
     NotifyFun = fun({updated, {<<Src:SrcSize/binary, $/, VbStr/binary>>, _}})
@@ -86,12 +94,21 @@ init([#rep{source = SrcBucketBinary, replication_mode = RepMode, options = Optio
     ?xdcr_debug("throttle process created (init throttle: ~p, work throttle: ~p)",
                 [InitThrottle, WorkThrottle]),
     Sup = start_vbucket_rep_sup(Rep),
+
     case ns_bucket:get_bucket(?b2l(SrcBucketBinary)) of
         {ok, SrcBucketConfig} ->
             Vbs = xdc_rep_utils:my_active_vbuckets(SrcBucketConfig),
+            UPRServ = case StreamFrom of
+                          ?XDCR_FROM_UPR ->
+                              start_upr_server(Rep, Vbs);
+                          _ ->
+                              nil
+                      end,
+            ?xdcr_debug("this replication will streamm data from ~s, upr server: ~p", [StreamFrom, UPRServ]),
             RepState0 = #replication{rep = Rep,
                                      mode = RepMode,
                                      vbs = Vbs,
+                                     upr_server = UPRServ,
                                      num_tokens = MaxConcurrentReps,
                                      init_throttle = InitThrottle,
                                      work_throttle = WorkThrottle,
@@ -102,11 +119,13 @@ init([#rep{source = SrcBucketBinary, replication_mode = RepMode, options = Optio
                         "would be created (error: ~p)", [Error]),
             RepState = #replication{rep = Rep,
                                     mode = RepMode,
+                                    upr_server = nil,
                                     num_tokens = MaxConcurrentReps,
                                     init_throttle = InitThrottle,
                                     work_throttle = WorkThrottle,
                                     vbucket_sup = Sup}
     end,
+
     {ok, RepState}.
 
 handle_call(stats, _From, #replication{vb_rep_dict = Dict,
@@ -407,8 +426,14 @@ handle_info({buckets, Buckets0},
     {noreply, NewState}.
 
 
-terminate(_Reason, #replication{vbucket_sup = Sup}) ->
+terminate(_Reason, #replication{upr_server = UPRSrv, vbucket_sup = Sup}) ->
     xdc_vbucket_rep_sup:shutdown(Sup),
+    %% shutdown UPR server if applicable
+    case UPRSrv of
+        nil -> ok;
+        S ->
+            ok = xdc_upr_server:disconnect(S)
+    end,
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -419,6 +444,7 @@ start_vb_replicators(#replication{rep = Rep,
                                   vbucket_sup = Sup,
                                   init_throttle = InitThrottle,
                                   work_throttle = WorkThrottle,
+                                  upr_server = UPRServ,
                                   vbs = Vbs,
                                   vb_rep_dict = Dict} = Replication) ->
     CurrentVbs = xdc_vbucket_rep_sup:vbucket_reps(Sup),
@@ -433,15 +459,15 @@ start_vb_replicators(#replication{rep = Rep,
                 end, Dict, RemovedVbs),
     % now start the new Vbs
     ?xdcr_debug("starting replicators for new vbs :~p", [NewVbs]),
+    VbStartOption = #xdc_vb_rep_start_option{
+      sup = Sup, rep = Rep, init_throttle = InitThrottle,
+      work_throttle = WorkThrottle, parent = self(), mode = RepMode,
+      upr_server = UPRServ},
+
     Dict3 = lists:foldl(
               fun(Vb, DictAcc) ->
-                      {ok, Pid} = xdc_vbucket_rep_sup:start_vbucket_rep(Sup,
-                                                                        Rep,
-                                                                        Vb,
-                                                                        InitThrottle,
-                                                                        WorkThrottle,
-                                                                        self(),
-                                                                        RepMode),
+                      {ok, Pid} = xdc_vbucket_rep_sup:start_vbucket_rep(
+                                    VbStartOption#xdc_vb_rep_start_option{vb = Vb}),
                       VbStatus = #rep_vb_status{pid = Pid},
                       dict:store(Vb, VbStatus, DictAcc)
               end, Dict2, misc:shuffle(NewVbs)),
@@ -501,3 +527,23 @@ compute_rate_stat(Written1, DataRepd1, RateStat) ->
                   end,
 
     NewRateStat.
+
+start_upr_server(#rep{source = Src, target = Tgt} = _Rep, Vbs) ->
+    SrcBucket = binary_to_list(Src),
+    TgtBucket = binary_to_list(Tgt),
+    ServName = ?format_msg("UPR server for replication from local bucket ~s to remote bucket ~s",
+                           [SrcBucket, TgtBucket]),
+
+    {ok, Pid} = xdc_upr_server:start(SrcBucket, self(), ServName, Vbs),
+    ?xdcr_debug("UPR Server (pid: ~p) ~s has been created.", [Pid, ServName]),
+
+    Pid =
+        case xdc_upr_server:connect(Pid) of
+            ok ->
+                ?xdcr_debug("UPR Server (pid: ~p) ~s is ready for streaming mutations.", [Pid, ServName]),
+                Pid;
+            Err ->
+                ?xdcr_debug("UPR Server (pid: ~p) ~s failed due to error ~p.", [Pid, ServName, Err]),
+                nil
+        end,
+    Pid.

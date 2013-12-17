@@ -18,6 +18,7 @@
 -include("couch_js_functions.hrl").
 -include("couch_api_wrap.hrl").
 -include("../lhttpc/lhttpc.hrl").
+-include_lib("couch_upr/include/couch_upr.hrl").
 
 %% ns_server headers
 -include("ns_common.hrl").
@@ -62,6 +63,11 @@
 %% concurrency throttle type
 -define(XDCR_INIT_CONCUR_THROTTLE, "xdcr-init").
 -define(XDCR_REPL_CONCUR_THROTTLE, "xdcr-repl").
+
+%% data source of streaming mutations
+-define(XDCR_FROM_UPR, "xdcr-from-upr").
+-define(XDCR_FROM_COUCHDB,   "xdcr-from-couchdb").
+
 
 %% -------------------------%%
 %%   XDCR data structures   %%
@@ -181,7 +187,9 @@
           %% history of last N errors
           error_reports = ringbuffer:new(?XDCR_ERROR_HISTORY),
           %% history of last N checkpoints
-          checkpoint_history = ringbuffer:new(?XDCR_CHECKPOINT_HISTORY)
+          checkpoint_history = ringbuffer:new(?XDCR_CHECKPOINT_HISTORY),
+          %% UPR server
+          upr_server = nil
          }).
 
 %% vbucket level replication state used by module xdc_vbucket_rep
@@ -228,6 +236,7 @@
           changes_queue,
           session_id,
           source_seq = nil,
+          upr_server = nil,
 
           %% a boolean variable indicating that the rep has already
           %% behind db purger, at least one deletion has been lost.
@@ -300,6 +309,18 @@
           worker_item_opt_repd = 0
          }).
 
+%% option to start vbucket replicator
+-record(xdc_vb_rep_start_option, {
+          sup,
+          vb,
+          rep = #rep{},
+          mode,
+          parent,
+          init_throttle,
+          work_throttle,
+          upr_server
+         }).
+
 %%-----------------------------------------%%
 %%            XDCR-MEMCACHED               %%
 %%-----------------------------------------%%
@@ -351,6 +372,159 @@
          }).
 
 
--endif.
+%% -------------------------------------------- %%
+%%     GENERIC UPR OPS CODES AND CONSTANTS      %%
+%% -------------------------------------------- %%
+%%--- START OF COPY FROM COUCHDB_URP.HRL --%%
+%%-define(UPR_HEADER_LEN, 24).
+%%-define(UPR_MAGIC_REQUEST, 16#80).
+%%-define(UPR_MAGIC_RESPONSE, 16#81).
+%%-define(UPR_OPCODE_OPEN_CONNECTION, 16#50).
+%%-define(UPR_OPCODE_STREAM_REQUEST, 16#53).
+%%-define(UPR_OPCODE_FAILOVER_LOG_REQUEST, 16#54).
+%%-define(UPR_OPCODE_STREAM_END, 16#55).
+%%-define(UPR_OPCODE_SNAPSHOT_MARKER, 16#56).
+%%-define(UPR_OPCODE_MUTATION, 16#57).
+%%-define(UPR_OPCODE_DELETION, 16#58).
+%%-define(UPR_OPCODE_EXPIRATION, 16#59).
+%%-define(UPR_OPCODE_STATS, 16#10).
+%%-define(UPR_OPCODE_SASL_AUTH, 16#21).
+%%-define(UPR_FLAG_OK, 16#00).
+%%-define(UPR_FLAG_STATE_CHANGED, 16#01).
+%%-define(UPR_FLAG_CONSUMER, 16#00).
+%%-define(UPR_FLAG_PRODUCER, 16#01).
+%%-define(UPR_REQUEST_TYPE_MUTATION, 16#03).
+%%-define(UPR_REQUEST_TYPE_DELETION, 16#04).
+%%-define(UPR_STATUS_OK, 16#00).
+%%-define(UPR_STATUS_KEY_NOT_FOUND, 16#01).
+%%-define(UPR_STATUS_ROLLBACK, 16#23).
+%%-define(UPR_STATUS_NOT_MY_VBUCKET, 16#07).
+%%-define(UPR_STATUS_ERANGE, 16#22).
+%%-define(UPR_STATUS_SASL_AUTH_FAILED, 16#20).
+%%% The sizes are in bits
+%%-define(UPR_SIZES_KEY_LENGTH, 16).
+%%-define(UPR_SIZES_PARTITION, 16).
+%%-define(UPR_SIZES_BODY, 32).
+%%-define(UPR_SIZES_OPAQUE, 32).
+%%-define(UPR_SIZES_CAS, 64).
+%%-define(UPR_SIZES_BY_SEQ, 64).
+%%-define(UPR_SIZES_REV_SEQ, 64).
+%%-define(UPR_SIZES_FLAGS, 32).
+%%-define(UPR_SIZES_EXPIRATION, 32).
+%%-define(UPR_SIZES_LOCK, 32).
+%%-define(UPR_SIZES_KEY, 40).
+%%-define(UPR_SIZES_VALUE, 56).
+%%-define(UPR_SIZES_PARTITION_UUID, 64).
+%%-define(UPR_SIZES_RESERVED, 32).
+%%-define(UPR_SIZES_STATUS, 16).
+%%-define(UPR_SIZES_SEQNO, 32).
+%%-define(UPR_SIZES_METADATA_LENGTH, 16).
+%%-define(UPR_SIZES_NRU_LENGTH, 8).
+%%
+% NOTE vmx 2014-01-16: In ep-engine the maximum size is currently 25
+%%-define(UPR_MAX_FAILOVER_LOG_SIZE, 25).
+%%
+%%-type upr_status() :: non_neg_integer().
+%%-type request_id() :: non_neg_integer().
+%%-type size()       :: non_neg_integer().
+%%-type socket()     :: port().
+%%
+%%% Those types are duplicates from couch_set_view.hrl
+%%-type uint64()                   :: 0..18446744073709551615.
+%%-type partition_id()             :: non_neg_integer().
+%%-type update_seq()               :: non_neg_integer().
+%%-type uuid()                     :: uint64().
+%%-type partition_version()        :: [{uuid(), update_seq()}].
+%%% Manipulate via ordsets or orddict, keep it ordered by partition id.
+%%-type partition_versions()       :: ordsets:ordset({partition_id(), partition_version()}).
+%%
+%%--- END OF COPY FROM COUCHDB_URP.HRL --%%
 
+%% -------------------------- %%
+%%  XDCR-UPR constants        %%
+%% -------------------------- %%
+-define(XDCR_UPR_MAX_FAILOVER_HISTORY, 100).
+-define(XDCR_UPR_DEFAULT_CONNECTION_TIMEOUT_MS, 30000).
+-define(XDCR_UPR_DEFAULT_PORT, 11210).
+
+%% -------------------------- %%
+%%  XDCR-UPR data structures  %%
+%% -------------------------- %%
+%%-record(xdc_upr_server_option, {
+%%          vbs = [],
+%%          name = nil,
+%%          timeout = 0,
+%%          ip = nil,
+%%          port = nil,
+%%          user = nil,
+%%          passwd = nil,
+%%          other = []
+%%         }).
+%%
+-record(xdc_upr_server_stats, {
+          num_mutations_streamed = 0,
+          data_bytes_streamed = 0
+         }).
+
+-record(xdc_upr_server_state, {
+          name = nil,
+          vbs = [],
+          bucket = nil,
+
+          timeout = 0,
+          ip = nil,
+          port = nil,
+          user = nil,
+          passwd = nil,
+
+          parent = nil,
+          socket = nil,
+          request_id = 0,
+          vb_versions = [],
+          vb_endseq = nil,
+          vb_rollback = nil,
+          stats = #xdc_upr_server_stats{},
+          status = undefined,
+          error_reports = nil
+         }).
+
+-record(xdc_upr_stream_request_option, {
+          vb = nil,
+          version = nil,
+          start_seq = 0,
+          end_seq = 0,
+          cbk_func = undefined,
+          aggregator = undefined
+         }).
+
+%% mutations streaming from UPR servre
+-record(xdc_upr_mutation, {
+          seq = 0        :: non_neg_integer(),
+          rev_seq = 0    :: non_neg_integer(),
+          cas = 0        :: non_neg_integer(),
+          flags = 0      :: non_neg_integer(),
+          expiration = 0 :: non_neg_integer(),
+          locktime = 0   :: non_neg_integer(),
+          key = <<>>     :: binary(),
+          val = <<>>     :: binary(),
+          key_length = 0    :: non_neg_integer(),
+          val_length = 0    :: non_neg_integer(),
+          metadata       :: binary()
+         }).
+
+%% end of XDCR-UPR
+
+%% an XDCR doc wrapper for doc_info and doc in couchdb
+%% this is to unify the doc structure to stream from couchdb and upr
+-record(xdc_doc, {
+          docinfo = #doc_info{},
+
+          %% the binary body
+          body = <<"{}">>,
+          %% unused, copy from couchdb.doc
+          meta = []
+         }).
+
+-endif.
 %% end of xdc_replicator.hrl
+
